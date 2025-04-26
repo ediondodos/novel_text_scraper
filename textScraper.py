@@ -1,151 +1,111 @@
-import json
-import sys
-import os
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
+import asyncio
+import aiofiles
+from tenacity import retry, stop_after_attempt, wait_exponential
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
-import time
+import re
 
-def novel_scraper(novel_name):
-    """ scraps the novel from novelbin.com"""
-
-     # Set up Chrome options for stealth
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--no-sandbox")
-    
-    # Speed optimization options
-    options.add_argument('--disable-images')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-extensions')
-    prefs = {"profile.managed_default_content_settings.images": 2}
-    options.add_experimental_option("prefs", prefs)
-    
-    # Format the novel name for the URL
+async def novel_scraper(novel_name):
+    """Async novel scraper using Playwright"""
     formatted_name = novel_name.lower().replace(" ", "-")
-    url = f"https://novelbin.com/b/{formatted_name}"
-       
-     # Initialize the driver
-    service = Service(executable_path=ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-
-
-
-    try:
-         # Navigate to the novel's URL first
-        driver.get(url)
-        print(f"Navigated to: {url}")
-        read_now_button = WebDriverWait(driver, 3).until(
-            EC.element_to_be_clickable((By.LINK_TEXT, "READ NOW"))
-        )
-        read_now_button.click()
-        print("Clicked READ NOW button.")
- 
-
+    base_url = f"https://novelbin.com/b/{formatted_name}"
     
-        # Main scraping loop
-        while True:
-            max_retries = 10
-            retry_count = 0
-            wait_time = 0.5  # Start with a shorter delay
-            
-            while retry_count < max_retries:
-                try:
-                    # More robust wait condition - wait for either the content or an error message
-                    WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.ID, "chr-content"))
-                    )
-                    break  # Content found, exit retry loop
-                except Exception as e:
-                    retry_count += 1
-
- 
-                    # Print only a simple status message to console
-                    print(f"Waiting attempt {retry_count}/{max_retries}...")
-                    # print(f"Waiting attempt {retry_count}/{max_retries}: {str(e)}")
-                    
-                    if retry_count >= max_retries:
-                        print(f"Maximum retries reached. Moving on.")
-                        break
-                    
-                    time.sleep(wait_time)
-                    wait_time *= 2  # Exponential backoff
-            
-            html_content = driver.page_source
-            soup = BeautifulSoup(html_content, 'html.parser')
-            chapter_content = soup.find("div", {"id": "chr-content"})
-            
-            if chapter_content and chapter_content.get_text().strip():
-                chapter_text = chapter_content.get_text("\n", strip=True)
-                print("\nChapter Text:")
-                print(chapter_text[:100] + "...")  # Show just a preview
-                
-                # Append chapter text to file
-                with open("chapter_text.txt", "a", encoding="utf-8") as f:
-                    f.write(chapter_text)
-                    f.write("\n\n--- End of Chapter ---\n\n")
-                print("\nText appended to chapter_text.txt")
-            else:
-                print("Chapter content not found or empty. Exiting.")
-                break
-            
-            # Attempt to navigate to the next chapter
-            try:
-                next_link = WebDriverWait(driver, 3).until(
-                    EC.element_to_be_clickable((By.LINK_TEXT, "Next Chapter"))
-                )
-                next_link.click()
-                print("Navigating to next chapter...")
-            except Exception as e:
-                print("No more chapters available or navigation error.")
-                break
-                
-    finally:
-        driver.quit()
-
-   
-def main():
-    try:
-          # Check if novel_name is provided as command line argument
-        # if len(sys.argv) < 2:
-        #     print("Usage:  python3 novel_takerV2.py  echo  'Kill the Sun' | python3 novel_taker+checherV1.py")
-        #     return
-            
-        # novel_name = sys.argv[1]
-
-         
-        # Check if novel_name is provided as command line argument
-        if len(sys.argv) > 1:
-            novel_name = sys.argv[1]
-        else:
-            # Try to read from stdin if no arguments provided
-            novel_name = sys.stdin.read().strip()
-         
-
+    async with async_playwright() as p:
+        # Configure browser with stealth options
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox"
+            ]
+        )
         
-    #     novel_scraper(novel_name.replace('*', '').strip() )
-    # except Exception as e:
-    #     print(f"Error: {str(e)}")
+        try:
+            # First pass - get chapter list
+            chapter_urls = await get_chapter_list(browser, base_url)
+            if not chapter_urls:
+                print("No chapters found")
+                return
 
-        if not novel_name:
-            print("Usage: python3 novel_taker+checherV1.py 'Novel Name'")
-            print("   or: echo 'Novel Name' | python3 novel_taker+checherV1.py")
-            return
+            # Second pass - parallel chapter scraping
+            semaphore = asyncio.Semaphore(5)  # Concurrent requests limit
+            tasks = [scrape_chapter(browser, url, semaphore) for url in chapter_urls]
+            chapters = await asyncio.gather(*tasks)
+
+            # Async write all chapters
+            async with aiofiles.open("chapters.txt", "w", encoding="utf-8") as f:
+                for chapter in chapters:
+                    if chapter:
+                        await f.write(f"{chapter}\n\n--- End of Chapter ---\n\n")
+
+        finally:
+            await browser.close()
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1))
+async def get_chapter_list(browser, base_url):
+    """Extract all chapter URLs from the table of contents"""
+    context = await browser.new_context()
+    page = await context.new_page()
+    
+    try:
+        await page.goto(base_url, timeout=60000)
+        await page.click("text=READ NOW")
+        
+        # Find chapter list pattern - adjust based on actual site structure
+        await page.wait_for_selector("#chr-content", timeout=10000)
+        
+        # Extract chapter URLs from navigation
+        chapter_urls = []
+        while True:
+            current_url = page.url
+            if current_url not in chapter_urls:
+                chapter_urls.append(current_url)
+                
+            next_link = await page.query_selector("a:has-text('Next Chapter')")
+            if not next_link:
+                break
+                
+            await next_link.click()
+            await page.wait_for_load_state("networkidle")
             
-        novel_scraper(novel_name.replace('*', '').strip())
+        return chapter_urls
+        
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error getting chapters: {str(e)}")
+        return []
+    finally:
+        await context.close()
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1))
+async def scrape_chapter(browser, url, semaphore):
+    """Scrape individual chapter with retry logic"""
+    async with semaphore:
+        context = await browser.new_context()
+        page = await context.new_page()
+        
+        try:
+            await page.goto(url, timeout=60000)
+            content = await page.wait_for_selector("#chr-content", timeout=10000)
+            html = await content.inner_html()
+            
+            # Clean content with BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for element in soup(["script", "style", "div.ads"]):
+                element.decompose()
+                
+            text = soup.get_text("\n", strip=True)
+            return f"Chapter {url.split('/')[-1]}:\n{text}"
+            
+        except Exception as e:
+            print(f"Failed to scrape {url}: {str(e)}")
+            return None
+        finally:
+            await context.close()
+
+async def main():
+    novel_name = input("Enter novel name: ").strip()
+    await novel_scraper(novel_name)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
